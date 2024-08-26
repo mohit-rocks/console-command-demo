@@ -1,0 +1,7 @@
+{
+  "patches": {
+    "drupal/core": {
+      "#3422359: Directory based automatic service creation": "./patches/3422359-10.2.3.patch"
+    }
+  }
+}

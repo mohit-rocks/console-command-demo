@@ -1,0 +1,9 @@
+services:
+  console.command.console_demo.service_argument:
+    class: Drupal\console_demo\Command\ServiceArgumentExample
+    arguments:
+      $cacheData: '@cache.data'
+    autowire: true
+    public: true
+    tags:
+      - { name: 'console.command' }

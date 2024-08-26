@@ -1,0 +1,1006 @@
+diff --git a/core/lib/Drupal/Core/DependencyInjection/YamlFileLoader.php b/core/lib/Drupal/Core/DependencyInjection/YamlFileLoader.php
+index f42b6115f8..c668c371d0 100644
+--- a/core/lib/Drupal/Core/DependencyInjection/YamlFileLoader.php
++++ b/core/lib/Drupal/Core/DependencyInjection/YamlFileLoader.php
+@@ -9,11 +9,12 @@
+ use Drupal\Component\Serialization\Exception\InvalidDataTypeException;
+ use Drupal\Core\Serialization\Yaml;
+ use Symfony\Component\DependencyInjection\Alias;
++use Symfony\Component\DependencyInjection\ChildDefinition;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\DependencyInjection\Definition;
+-use Symfony\Component\DependencyInjection\ChildDefinition;
+-use Symfony\Component\DependencyInjection\Reference;
+ use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
++use Symfony\Component\DependencyInjection\Reference;
++use Symfony\Component\Finder\Finder;
+ 
+ /**
+  * YamlFileLoader loads YAML files service definitions.
+@@ -396,7 +397,130 @@ private function parseDefinition(string $id, $service, string $file, array $defa
+             $definition->setAutowired($service['autowire']);
+         }
+ 
+-        $this->container->setDefinition($id, $definition);
++        if (isset($service['autoconfigure'])) {
++           $definition->setAutoconfigured($service['autoconfigure']);
++        }
++
++        if (array_key_exists('module', $service) || array_key_exists('modules', $service)) {
++            if (array_key_exists('resource', $service)) {
++              throw new \InvalidArgumentException('Service definitions may not have a `module` or `modules` definition simultaneously with a `resource` definition.');
++            }
++
++            [$provider] = explode('.', basename($file), 2);
++            $this->registerModuleDiscovery(
++                (array) $this->container->get('container.namespaces'),
++                $definition,
++                $provider,
++                array_intersect_key($service['module'] ?? [], array_flip(['paths'])),
++                array_intersect_key($service['modules'] ?? [], array_flip(['paths'])),
++            );
++        }
++        else {
++            $this->container->setDefinition($id, $definition);
++        }
++    }
++
++    /**
++     * Merges discovery paths, globs paths, and adds classes to container.
++     *
++     * @param \Symfony\Component\DependencyInjection\Definition $prototype
++     *   A definition to use as template
++     * @param array{paths?: string[]} $thisModuleConfiguration
++     *   Configures automatic service creation for all classes in paths for the
++     *   module in context.
++     * @param array{paths?: string[]} $allModulesConfiguration
++     *   Configures automatic service creation for all classes in paths for all
++     *   enabled modules.
++     */
++    private function registerModuleDiscovery(array $namespaces, Definition $prototype, string $provider, array $thisModuleConfiguration, array $allModulesConfiguration): void {
++        $discovery = static function (array $namespaces, string $scopePath, ContainerInterface $container, bool $isAllNamespaces) {
++            $classes = [];
++
++            foreach ($namespaces as $moduleNamespace => $moduleSrcPath) {
++                $absoluteModuleSrcPath = DRUPAL_ROOT .  '/' . $moduleSrcPath;
++                $prefix = dirname($moduleSrcPath) . '/' . ltrim($scopePath, '/');
++
++                // This strcspn conditional is the same one implemented by
++                // \Symfony\Component\Config\Loader\FileLoader::glob().
++                if (\strlen($prefix) !== strcspn($prefix, '*?{[')) {
++                    throw new \Exception('Globbing is not supported in patterns.');
++                }
++
++                // Normalize the path by removing redundant slashes and ensuring
++                // the path exists.
++                $prefix = realpath($prefix);
++                if ($prefix === FALSE) {
++                    // Skip when module doesn't have a matching path.
++                    continue;
++                }
++
++                if ($isAllNamespaces === TRUE && $prefix === $absoluteModuleSrcPath) {
++                    throw new \Exception('Paths for all modules must be a subdirectory of src/.');
++                }
++
++                $files = (new Finder())
++                   ->followLinks()
++                   ->in($prefix);
++
++                $prefixLen = \strlen($absoluteModuleSrcPath);
++                foreach ($files as $path => $info) {
++                    if (!str_starts_with($path, $absoluteModuleSrcPath)) {
++                        throw new \Exception('Paths may not escape extension src/ directories with relative paths.');
++                    }
++
++                    if (!str_ends_with($path, '.php')) {
++                        continue;
++                    }
++
++                    $class = $moduleNamespace . '\\' . ltrim(str_replace('/', '\\', substr($path, $prefixLen, -4)), '\\');
++
++                    try {
++                        $r = $container->getReflectionClass($class);
++                    }
++                    catch (\ReflectionException $e) {
++                        $classes[$class] = $e->getMessage();
++                        continue;
++                    }
++
++                  // check to make sure the expected class exists
++                  if (!$r) {
++                      throw new InvalidArgumentException(sprintf('Expected to find class "%s" in file "%s".', $class, $path));
++                  }
++
++                  if ($r->isInstantiable() || $r->isInterface()) {
++                      $classes[$class] = null;
++                  }
++                }
++            }
++
++            return $classes;
++        };
++
++        $classes = [];
++        foreach ($thisModuleConfiguration['paths'] ?? [] as $path) {
++            $classes += $discovery(array_intersect_key($namespaces, array_flip(['Drupal\\' . $provider])), $path, $this->container, FALSE);
++        }
++        foreach ($allModulesConfiguration['paths'] ?? [] as $path) {
++            $classes += $discovery($namespaces, $path, $this->container, TRUE);
++        }
++
++        $existingClasses = array_map(static fn(Definition $definition): ?string => $definition->getClass(), $this->container->getDefinitions());
++        $getPrototype = static fn () => clone $prototype;
++        foreach ($classes as $class => $errorMessage) {
++            // Ignore services if they already exist:
++            if ($this->container->has($class) || in_array($class, $existingClasses, TRUE)) {
++                continue;
++            }
++
++            $definition = $getPrototype();
++            $this->container->setDefinition($class, $definition);
++            if (null !== $errorMessage) {
++                $definition->addError($errorMessage);
++
++                continue;
++            }
++            $definition->setClass($class);
++        }
+     }
+ 
+     /**
+diff --git a/core/misc/cspell/dictionary.txt b/core/misc/cspell/dictionary.txt
+index 283331f4e1..70d35ecd18 100644
+--- a/core/misc/cspell/dictionary.txt
++++ b/core/misc/cspell/dictionary.txt
+@@ -330,6 +330,8 @@ fulltext
+ funic
+ gabilondo
+ gids
++glob
++globbing
+ gloop
+ gnumeric
+ googleapis
+diff --git a/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.info.yml
+new file mode 100644
+index 0000000000..eb801e3536
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.info.yml
+@@ -0,0 +1,5 @@
++name: Container module discovery tests
++type: module
++description: Contains service definitions with `module` and `modules` entries.
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.services.yml
+new file mode 100644
+index 0000000000..4dc6bd6835
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/module_discovery_test.services.yml
+@@ -0,0 +1,5 @@
++services:
++  test_services:
++    module:
++      paths:
++        - '/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.info.yml
+new file mode 100644
+index 0000000000..f9363c72d9
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.info.yml
+@@ -0,0 +1,5 @@
++name: Tests src directory in modules
++description: Tests 'src' may not be used for modules outside of this module.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.services.yml
+new file mode 100644
+index 0000000000..14d1233e8a
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_all_src_test/module_discovery_all_src_test.services.yml
+@@ -0,0 +1,5 @@
++services:
++  src_in_modules:
++    modules:
++      paths:
++        - '/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/module_discovery_attribute_method_service_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/module_discovery_attribute_method_service_test.info.yml
+new file mode 100644
+index 0000000000..886a1115a8
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/module_discovery_attribute_method_service_test.info.yml
+@@ -0,0 +1,5 @@
++name: Attribute to service tag test.
++type: module
++description: Tests classes and methods in a namespace are converted to services and tagged.
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/src/AttributeToService/TestMethodService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/src/AttributeToService/TestMethodService.php
+new file mode 100644
+index 0000000000..e204b3d30e
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_method_service_test/src/AttributeToService/TestMethodService.php
+@@ -0,0 +1,24 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_attribute_method_service_test\AttributeToService;
++
++use Drupal\module_discovery_attribute_service_test\Attribute\AttributeToService;
++
++/**
++ * Class for testing conversion to a service.
++ *
++ * Multiple methods are used to test only one service is created.
++ */
++final class TestMethodService {
++
++  #[AttributeToService]
++  public function foo(): void {
++  }
++
++  #[AttributeToService]
++  public function bar(): void {
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/module_discovery_attribute_other_service_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/module_discovery_attribute_other_service_test.info.yml
+new file mode 100644
+index 0000000000..886a1115a8
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/module_discovery_attribute_other_service_test.info.yml
+@@ -0,0 +1,5 @@
++name: Attribute to service tag test.
++type: module
++description: Tests classes and methods in a namespace are converted to services and tagged.
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/src/AttributeToService/OtherTestClassService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/src/AttributeToService/OtherTestClassService.php
+new file mode 100644
+index 0000000000..fa77037e47
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_other_service_test/src/AttributeToService/OtherTestClassService.php
+@@ -0,0 +1,15 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_attribute_other_service_test\AttributeToService;
++
++use Drupal\module_discovery_attribute_service_test\Attribute\AttributeToService;
++
++/**
++ * Class for testing conversion to a service.
++ */
++#[AttributeToService]
++final class OtherTestClassService {
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.info.yml
+new file mode 100644
+index 0000000000..886a1115a8
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.info.yml
+@@ -0,0 +1,5 @@
++name: Attribute to service tag test.
++type: module
++description: Tests classes and methods in a namespace are converted to services and tagged.
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.services.yml
+new file mode 100644
+index 0000000000..b4b7f2d1cb
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/module_discovery_attribute_service_test.services.yml
+@@ -0,0 +1,13 @@
++services:
++  autoconfigure_attribute_to_service:
++    autoconfigure: true
++    modules:
++      paths:
++        - '/src/AttributeToService/'
++
++  autoconfigure_attribute_to_service_locator:
++    class: Symfony\Component\DependencyInjection\ServiceLocator
++    arguments:
++      - "!abstract 'Services tagged with `attribute_to_service`'"
++    tags:
++      - { name: container.service_locator }
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/Attribute/AttributeToService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/Attribute/AttributeToService.php
+new file mode 100644
+index 0000000000..57893b91a7
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/Attribute/AttributeToService.php
+@@ -0,0 +1,13 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_attribute_service_test\Attribute;
++
++/**
++ * Service tag to autoconfigure classes or methods.
++ */
++#[\Attribute(\Attribute::TARGET_CLASS | \Attribute::TARGET_METHOD)]
++class AttributeToService {
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationCompilerPass.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationCompilerPass.php
+new file mode 100644
+index 0000000000..cfa70d17f0
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationCompilerPass.php
+@@ -0,0 +1,29 @@
++<?php
++
++declare(strict_types = 1);
++
++namespace Drupal\module_discovery_attribute_service_test;
++
++use Drupal\module_discovery_attribute_service_test\Attribute\AttributeToService;
++use Symfony\Component\DependencyInjection\ChildDefinition;
++use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
++use Symfony\Component\DependencyInjection\ContainerBuilder;
++
++/**
++ * Attribute autoconfiguration compiler pass.
++ */
++final class AttributeAutoconfigurationCompilerPass implements CompilerPassInterface {
++
++  public const SERVICE_TAG = 'attribute_to_service';
++
++  /**
++   * {@inheritdoc}
++   */
++  public function process(ContainerBuilder $container): void {
++    $container->registerAttributeForAutoconfiguration(AttributeToService::class, static function (ChildDefinition $definition, AttributeToService $attribute, \ReflectionClass|\ReflectionMethod $reflector) {
++      $tagAttributes = get_object_vars($attribute);
++      $definition->addTag(static::SERVICE_TAG, $tagAttributes);
++    });
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationLocatorPass.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationLocatorPass.php
+new file mode 100644
+index 0000000000..967df5f7d0
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeAutoconfigurationLocatorPass.php
+@@ -0,0 +1,30 @@
++<?php
++
++declare(strict_types = 1);
++
++namespace Drupal\module_discovery_attribute_service_test;
++
++use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
++use Symfony\Component\DependencyInjection\ContainerBuilder;
++use Symfony\Component\DependencyInjection\Reference;
++
++/**
++ * Attribute autoconfiguration compiler pass.
++ */
++final class AttributeAutoconfigurationLocatorPass implements CompilerPassInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function process(ContainerBuilder $container): void {
++    // Runtime code can't tell if a service received a tag, use a service
++    // locator to bring them together.
++    $references = [];
++    foreach ($container->findTaggedServiceIds(AttributeAutoconfigurationCompilerPass::SERVICE_TAG) as $serviceId => $tags) {
++      $references[$serviceId] = new Reference($serviceId);
++    }
++    $container->getDefinition('autoconfigure_attribute_to_service_locator')
++      ->replaceArgument(0, $references);
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeToService/TestClassService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeToService/TestClassService.php
+new file mode 100644
+index 0000000000..b3bc4d8d74
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/AttributeToService/TestClassService.php
+@@ -0,0 +1,15 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_attribute_service_test\AttributeToService;
++
++use Drupal\module_discovery_attribute_service_test\Attribute\AttributeToService;
++
++/**
++ * Class for testing conversion to a service.
++ */
++#[AttributeToService]
++final class TestClassService {
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/ModuleDiscoveryAttributeServiceTestServiceProvider.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/ModuleDiscoveryAttributeServiceTestServiceProvider.php
+new file mode 100644
+index 0000000000..89cf67e11f
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_attribute_service_test/src/ModuleDiscoveryAttributeServiceTestServiceProvider.php
+@@ -0,0 +1,26 @@
++<?php
++
++declare(strict_types = 1);
++
++namespace Drupal\module_discovery_attribute_service_test;
++
++use Drupal\Core\DependencyInjection\ContainerBuilder;
++use Drupal\Core\DependencyInjection\ServiceProviderInterface;
++
++/**
++ * Service provider for Module Discovery Test.
++ */
++final class ModuleDiscoveryAttributeServiceTestServiceProvider implements ServiceProviderInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function register(ContainerBuilder $container): void {
++    $container
++      // Priority 200 to execute before AttributeAutoconfigurationPass which has
++      // priority 100. See symfony/dependency-injection/Compiler/PassConfig.php.
++      ->addCompilerPass(new AttributeAutoconfigurationCompilerPass(), priority: 200)
++      ->addCompilerPass(new AttributeAutoconfigurationLocatorPass());
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.info.yml
+new file mode 100644
+index 0000000000..9f430f0c13
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.info.yml
+@@ -0,0 +1,5 @@
++name: Module collision test
++description: Tests existing services are not re-created.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.services.yml
+new file mode 100644
+index 0000000000..5dfa1d53db
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/module_discovery_collision_test.services.yml
+@@ -0,0 +1,18 @@
++services:
++  service_by_id:
++    class: Drupal\module_discovery_collision_test\ExistingServiceById
++    arguments:
++      - 'definition_from_yaml'
++
++  Drupal\module_discovery_collision_test\ExistingServiceByClass:
++    class: Drupal\module_discovery_collision_test\ExistingServiceByClass
++    arguments:
++      - 'definition_from_yaml'
++
++  collision_test:
++    arguments:
++      - 'definition_from_discovery'
++
++    module:
++      paths:
++        - '/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceByClass.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceByClass.php
+new file mode 100644
+index 0000000000..48fa31a741
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceByClass.php
+@@ -0,0 +1,17 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_collision_test;
++
++/**
++ * Class for testing existing class collision.
++ */
++final class ExistingServiceByClass {
++
++  public function __construct(
++    public readonly string $definitionSource,
++  ) {
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceById.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceById.php
+new file mode 100644
+index 0000000000..acae67ce35
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/ExistingServiceById.php
+@@ -0,0 +1,17 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_collision_test;
++
++/**
++ * Class for testing existing class collision.
++ */
++final class ExistingServiceById {
++
++  public function __construct(
++    public readonly string $definitionSource,
++  ) {
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/NewDiscoveryService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/NewDiscoveryService.php
+new file mode 100644
+index 0000000000..ce16765a44
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_collision_test/src/NewDiscoveryService.php
+@@ -0,0 +1,17 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_collision_test;
++
++/**
++ * Class for testing existing class collision.
++ */
++final class NewDiscoveryService {
++
++  public function __construct(
++    public readonly string $definitionSource,
++  ) {
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.info.yml
+new file mode 100644
+index 0000000000..1c97044011
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.info.yml
+@@ -0,0 +1,5 @@
++name: Module discovery service definition template
++description: Tests service definition defaults are copied to created services.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.services.yml
+new file mode 100644
+index 0000000000..2f8201343c
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/module_discovery_definition_template_test.services.yml
+@@ -0,0 +1,16 @@
++services:
++  # For testing defaults from this definition are copied to created services:
++  definition_template:
++    autowire: true
++    tags:
++      - { name: tag_copied_to_all_services }
++    modules:
++      paths:
++        - '/src/ServiceDefinitionTemplate/'
++
++  definition_template_locator:
++    class: Symfony\Component\DependencyInjection\ServiceLocator
++    arguments:
++      - "!abstract 'Services tagged with `tag_copied_to_all_services`'"
++    tags:
++      - { name: container.service_locator }
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/DiscoveryDefinitionTemplateLocatorPass.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/DiscoveryDefinitionTemplateLocatorPass.php
+new file mode 100644
+index 0000000000..e6825f0ca2
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/DiscoveryDefinitionTemplateLocatorPass.php
+@@ -0,0 +1,30 @@
++<?php
++
++declare(strict_types = 1);
++
++namespace Drupal\module_discovery_definition_template_test;
++
++use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
++use Symfony\Component\DependencyInjection\ContainerBuilder;
++use Symfony\Component\DependencyInjection\Reference;
++
++/**
++ * Module discovery definition template compiler pass.
++ */
++final class DiscoveryDefinitionTemplateLocatorPass implements CompilerPassInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function process(ContainerBuilder $container): void {
++    // Runtime code can't tell if a service received a tag, use a service
++    // locator to bring them together.
++    $references = [];
++    foreach ($container->findTaggedServiceIds('tag_copied_to_all_services') as $serviceId => $tags) {
++      $references[$serviceId] = new Reference($serviceId);
++    }
++    $container->getDefinition('definition_template_locator')
++      ->replaceArgument(0, $references);
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ModuleDiscoveryDefinitionTemplateTestServiceProvider.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ModuleDiscoveryDefinitionTemplateTestServiceProvider.php
+new file mode 100644
+index 0000000000..48fc1de891
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ModuleDiscoveryDefinitionTemplateTestServiceProvider.php
+@@ -0,0 +1,23 @@
++<?php
++
++declare(strict_types = 1);
++
++namespace Drupal\module_discovery_definition_template_test;
++
++use Drupal\Core\DependencyInjection\ContainerBuilder;
++use Drupal\Core\DependencyInjection\ServiceProviderInterface;
++
++/**
++ * Service provider for Module Discovery Definition Template Test.
++ */
++final class ModuleDiscoveryDefinitionTemplateTestServiceProvider implements ServiceProviderInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function register(ContainerBuilder $container): void {
++    $container
++      ->addCompilerPass(new DiscoveryDefinitionTemplateLocatorPass());
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ServiceDefinitionTemplate/TestServiceDefinitionTemplate.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ServiceDefinitionTemplate/TestServiceDefinitionTemplate.php
+new file mode 100644
+index 0000000000..7cb1215ca8
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_definition_template_test/src/ServiceDefinitionTemplate/TestServiceDefinitionTemplate.php
+@@ -0,0 +1,31 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_definition_template_test\ServiceDefinitionTemplate;
++
++use Drupal\Component\Datetime\TimeInterface;
++use Drupal\module_discovery_attribute_service_test\Attribute\AttributeToService;
++
++/**
++ * Class for testing conversion to a service.
++ */
++#[AttributeToService]
++final class TestServiceDefinitionTemplate {
++
++  /**
++   * Constructor is used to test autowire default from definition.
++   */
++  public function __construct(
++    private readonly TimeInterface $time,
++  ) {
++  }
++
++  /**
++   * Get the time.
++   */
++  public function getTime(): string {
++    return 'The time is ' . (new \DateTimeImmutable('@' . $this->time->getRequestTime()))->format('r');
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.info.yml
+new file mode 100644
+index 0000000000..4fa96e02db
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.info.yml
+@@ -0,0 +1,5 @@
++name: Module discovery escape test
++description: Module referencing something outside of its directory.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.services.yml
+new file mode 100644
+index 0000000000..76cb248dd2
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_escape_test/module_discovery_escape_test.services.yml
+@@ -0,0 +1,5 @@
++services:
++  escape_test:
++    modules:
++      paths:
++        - '/../module_discovery_attribute_service_test/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.info.yml
+new file mode 100644
+index 0000000000..31722d9fe4
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.info.yml
+@@ -0,0 +1,5 @@
++name: Module discovery glob tests
++type: module
++description: Module with various directory levels and file names for testing globs.
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.services.yml
+new file mode 100644
+index 0000000000..7a5965ceee
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/module_discovery_glob_test.services.yml
+@@ -0,0 +1,5 @@
++services:
++  glob_test:
++    modules:
++      paths:
++        - '/src/*'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/FirstService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/FirstService.php
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/SecondService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/SecondService.php
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/Third/ThirdService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/Third/ThirdService.php
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/UnmatchedSecondService.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_glob_test/src/Second/UnmatchedSecondService.php
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.info.yml
+new file mode 100644
+index 0000000000..73f43dcf38
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.info.yml
+@@ -0,0 +1,5 @@
++name: Module discovery with a malformed class
++description: Contains a module for discovery which contains a class that throws an exception on reflection.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.services.yml
+new file mode 100644
+index 0000000000..3544d8793a
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/module_discovery_malformed_class_test.services.yml
+@@ -0,0 +1,5 @@
++services:
++  bad_class:
++    module:
++      paths:
++        - '/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/src/BadClass.php b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/src/BadClass.php
+new file mode 100644
+index 0000000000..cac5054774
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/src/BadClass.php
+@@ -0,0 +1,12 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_malformed_class_test;
++
++/**
++ * A class that throws an exception on reflection.
++ */
++final class BadClass extends BadInterface {
++
++}
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.info.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.info.yml
+new file mode 100644
+index 0000000000..58c732a71e
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.info.yml
+@@ -0,0 +1,5 @@
++name: Tests modules and resources.
++description: Tests 'resource' alongside module.
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.services.yml b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.services.yml
+new file mode 100644
+index 0000000000..7525319e43
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/modules/module_discovery_with_resource_test/module_discovery_with_resource_test.services.yml
+@@ -0,0 +1,6 @@
++services:
++  with_resource:
++    resource: 'src/'
++    module:
++      paths:
++        - '/src/'
+diff --git a/core/modules/system/tests/modules/module_discovery_test/src/TestService.php b/core/modules/system/tests/modules/module_discovery_test/src/TestService.php
+new file mode 100644
+index 0000000000..d83ab5b34f
+--- /dev/null
++++ b/core/modules/system/tests/modules/module_discovery_test/src/TestService.php
+@@ -0,0 +1,12 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\module_discovery_test;
++
++/**
++ * Class for testing conversion to a service.
++ */
++final class TestService {
++
++}
+diff --git a/core/modules/system/tests/src/Kernel/ModuleDiscovery/ModuleDiscoveryTest.php b/core/modules/system/tests/src/Kernel/ModuleDiscovery/ModuleDiscoveryTest.php
+new file mode 100644
+index 0000000000..a0ba8ec8dc
+--- /dev/null
++++ b/core/modules/system/tests/src/Kernel/ModuleDiscovery/ModuleDiscoveryTest.php
+@@ -0,0 +1,158 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Tests\system\Kernel\ModuleDiscovery;
++
++use Drupal\Core\Extension\ModuleInstallerInterface;
++use Drupal\KernelTests\KernelTestBase;
++use Drupal\module_discovery_attribute_method_service_test\AttributeToService\TestMethodService;
++use Drupal\module_discovery_attribute_other_service_test\AttributeToService\OtherTestClassService;
++use Drupal\module_discovery_attribute_service_test\AttributeToService\TestClassService;
++use Drupal\module_discovery_collision_test\ExistingServiceByClass;
++use Drupal\module_discovery_collision_test\NewDiscoveryService;
++use Drupal\module_discovery_definition_template_test\ServiceDefinitionTemplate\TestServiceDefinitionTemplate;
++use Drupal\module_discovery_test\TestService;
++use Symfony\Component\HttpFoundation\Request;
++use Symfony\Component\HttpFoundation\Session\Session;
++use Symfony\Component\HttpFoundation\Session\Storage\MockArraySessionStorage;
++
++/**
++ * Tests services automatically created from 'module' or 'modules' paths.
++ *
++ * @group ModuleDiscovery
++ */
++final class ModuleDiscoveryTest extends KernelTestBase {
++
++  /**
++   * Tests 'src' path for 'module' converts classes to services.
++   */
++  public function testSrc(): void {
++    $this->moduleInstaller()->install(['module_discovery_test']);
++    $this->assertInstanceOf(TestService::class, \Drupal::getContainer()->get(TestService::class));
++  }
++
++  /**
++   * Tests 'src' path for 'modules' throws an exception.
++   */
++  public function testSrcInModules(): void {
++    $this->expectExceptionMessage('Paths for all modules must be a subdirectory of src/.');
++    $this->moduleInstaller()->install(['module_discovery_all_src_test']);
++  }
++
++  /**
++   * Tests 'resource' alongside 'module' throws an exception.
++   */
++  public function testResourceWithModule(): void {
++    $this->expectExceptionMessage('Service definitions may not have a `module` or `modules` definition simultaneously with a `resource` definition.');
++    $this->moduleInstaller()->install(['module_discovery_with_resource_test']);
++  }
++
++  /**
++   * Referencing directories outside its own directory throw an exception.
++   */
++  public function testEscapeDirectory(): void {
++    $this->expectExceptionMessage('Paths may not escape extension src/ directories with relative paths.');
++    $this->moduleInstaller()->install(['module_discovery_escape_test']);
++  }
++
++  /**
++   * Tests existing services are not re-created.
++   */
++  public function testExistingServices(): void {
++    $this->moduleInstaller()->install(['module_discovery_collision_test']);
++    $container = \Drupal::getContainer();
++    // These services are defined in YAML and are not overridden.
++    $this->assertEquals('definition_from_yaml', $container->get('service_by_id')->definitionSource);
++    $this->assertEquals('definition_from_yaml', $container->get(ExistingServiceByClass::class)->definitionSource);
++    // This service is automatically created.
++    $this->assertEquals('definition_from_discovery', $container->get(NewDiscoveryService::class)->definitionSource);
++  }
++
++  /**
++   * Tests globs patterns do not work.
++   */
++  public function testGlobbingPatterns(): void {
++    $this->expectExceptionMessage('Globbing is not supported in patterns.');
++    $this->moduleInstaller()->install(['module_discovery_glob_test']);
++  }
++
++  /**
++   * Test a class that cannot be reflected.
++   */
++  public function testMalformedClass(): void {
++    $this->expectExceptionMessage('Class "Drupal\module_discovery_malformed_class_test\BadInterface" not found');
++    $this->moduleInstaller()->install(['module_discovery_malformed_class_test']);
++  }
++
++  /**
++   * Tests services with autoconfigured attributes are created.
++   */
++  public function testAutoconfigureAttribute(): void {
++    $this->moduleInstaller()->install([
++      'module_discovery_attribute_service_test',
++      'module_discovery_attribute_other_service_test',
++      'module_discovery_attribute_method_service_test',
++    ]);
++
++    $container = \Drupal::getContainer();
++    $this->assertInstanceOf(TestClassService::class, $container->get(TestClassService::class));
++    $this->assertInstanceOf(OtherTestClassService::class, $container->get(OtherTestClassService::class));
++    $this->assertInstanceOf(TestMethodService::class, $container->get(TestMethodService::class));
++
++    // Runtime code cant tell if a service received a tag or not, so we rely on
++    // a service locator to bring them together.
++    /** @var \Symfony\Component\DependencyInjection\ServiceLocator $locator */
++    $locator = $container->get('autoconfigure_attribute_to_service_locator');
++    $this->assertInstanceOf(TestClassService::class, $locator->get(TestClassService::class));
++    $this->assertInstanceOf(OtherTestClassService::class, $locator->get(OtherTestClassService::class));
++    $this->assertInstanceOf(TestMethodService::class, $locator->get(TestMethodService::class));
++    // Ensure no other services were added to the locator, and that method
++    // service with multiple attributes did not create multiple services.
++    $this->assertCount(3, $locator);
++  }
++
++  /**
++   * Tests defaults from the service definition are copied to created services.
++   */
++  public function testDerivativeServiceDefinitions(): void {
++    $this->moduleInstaller()->install([
++      'module_discovery_definition_template_test',
++    ]);
++
++    $container = \Drupal::getContainer();
++    $this->assertInstanceOf(TestServiceDefinitionTemplate::class, $container->get(TestServiceDefinitionTemplate::class));
++
++    // Runtime code cant tell if a service received a tag or not, so we rely on
++    // a service locator to bring them together.
++    /** @var \Symfony\Component\DependencyInjection\ServiceLocator $locator */
++    $locator = $container->get('definition_template_locator');
++    $this->assertCount(1, $locator);
++    $service = $locator->get(TestServiceDefinitionTemplate::class);
++    $this->assertInstanceOf(TestServiceDefinitionTemplate::class, $service);
++    // Call the method to ensure autowiring.
++    $this->assertStringContainsString('The time is', $service->getTime());
++  }
++
++  /**
++   * The module installer.
++   */
++  private function moduleInstaller(): ModuleInstallerInterface {
++    return \Drupal::service('module_installer');
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function tearDown(): void {
++    // Failed module install with invalid class causes requests to blow up.
++    $request = Request::create('');
++    $request->setSession(new Session(new MockArraySessionStorage()));
++    /** @var \Symfony\Component\HttpFoundation\RequestStack $request_stack */
++    $request_stack = $this->container->get('request_stack');
++    $request_stack->push($request);
++
++    parent::tearDown();
++  }
++
++}
+diff --git a/core/phpstan.neon.dist b/core/phpstan.neon.dist
+index f28e9249f5..140839ee03 100644
+--- a/core/phpstan.neon.dist
++++ b/core/phpstan.neon.dist
+@@ -31,6 +31,7 @@ parameters:
+     - modules/system/tests/modules/plugin_test/src/Plugin/plugin_test/fruit/ExtendingNonInstalledClass.php
+     - modules/system/tests/modules/plugin_test/src/Plugin/plugin_test/custom_annotation/UsingNonInstalledTraitClass.php
+     - modules/system/tests/modules/plugin_test/src/Plugin/plugin_test/custom_annotation/ExtendingNonInstalledClass.php
++    - modules/system/tests/modules/module_discovery_test/modules/module_discovery_malformed_class_test/src/BadClass.php
+ 
+   ignoreErrors:
+     # new static() is a best practice in Drupal, so we cannot fix that.

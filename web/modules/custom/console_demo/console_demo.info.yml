@@ -1,0 +1,7 @@
+name: console_demo
+type: module
+description: 'Provides test console commands for the demo implementation.'
+core_version_requirement: ^10
+package: Demo
+dependencies:
+  - dex_console:dex_console

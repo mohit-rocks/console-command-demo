@@ -1,0 +1,1211 @@
+From 90dc2e0c4370971a7d931d5efa15140fc3866ec2 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 18:15:35 +0800
+Subject: [PATCH 1/9] Dex
+
+---
+ composer.json                                 |   3 +-
+ core/bin/dex                                  |  60 ++++++
+ core/composer.json                            |   4 +
+ core/core.services.yml                        |   7 +
+ core/lib/Drupal/Core/CoreServiceProvider.php  |   4 +
+ .../Compiler/DexCompilerPass.php              | 176 ++++++++++++++++++
+ .../tests/modules/dex_test/dex_test.info.yml  |   4 +
+ .../src/Command/DexExampleCommand.php         |  41 ++++
+ 8 files changed, 298 insertions(+), 1 deletion(-)
+ create mode 100755 core/bin/dex
+ create mode 100644 core/lib/Drupal/Core/DependencyInjection/Compiler/DexCompilerPass.php
+ create mode 100644 core/modules/system/tests/modules/dex_test/dex_test.info.yml
+ create mode 100644 core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
+
+diff --git a/composer.json b/composer.json
+index 093a47ffb084..9928fd0e74bc 100644
+--- a/composer.json
++++ b/composer.json
+@@ -64,7 +64,8 @@
+             "drupal/core-vendor-hardening": true,
+             "phpstan/extension-installer": true,
+             "dealerdirect/phpcodesniffer-composer-installer": true,
+-            "php-http/discovery": true
++            "php-http/discovery": true,
++            "symfony/runtime": true
+         }
+     },
+     "extra": {
+diff --git a/core/bin/dex b/core/bin/dex
+new file mode 100755
+index 000000000000..5863ef49904c
+--- /dev/null
++++ b/core/bin/dex
+@@ -0,0 +1,60 @@
++#!/usr/bin/env php
++<?php
++
++declare(strict_types = 1);
++
++use Composer\Autoload\ClassLoader;
++use Drupal\Core\DrupalKernel;
++use Drupal\Core\Site\Settings;
++use Symfony\Component\Console\Application;
++use Symfony\Component\HttpFoundation\Request;
++
++// We have the luxury of using this global.
++# https://getcomposer.org/doc/articles/vendor-binaries.md#finding-the-composer-autoloader-from-a-binary
++require_once dirname($GLOBALS['_composer_autoload_path']) . '/autoload_runtime.php';
++
++if ('cli' !== \PHP_SAPI) {
++  throw new Exception('This script must be run from the command line.');
++}
++
++// Utilizes the https://symfony.com/doc/current/components/runtime.html component
++// to encapsulate the application cleanly.
++return static function (array $context): Application {
++  $loaders = ClassLoader::getRegisteredLoaders();
++  $classLoader = reset($loaders);
++
++  // Discovery can get out of whack if cleared caches and try to run this
++  // command without a web request priming discovery.
++  chdir(\DRUPAL_ROOT);
++  $kernel = new DrupalKernel('prod', $classLoader, FALSE);
++  $kernel::bootEnvironment();
++  $kernel->setSitePath($context['DRUPAL_DEV_SITE_PATH'] ?? 'sites/default');
++  Settings::initialize($kernel->getAppRoot(), $kernel->getSitePath(), $classLoader);
++  $kernel->boot();
++
++  // Drupal is highly dependent on a Request:
++  $request = Request::createFromGlobals();
++  $baseDomain = $context['HOST'] ?? NULL;
++  $basePort = $context['PORT'] ?? NULL;
++  if ($baseDomain !== NULL) {
++    $request->server->set('SERVER_NAME', $baseDomain);
++    if ($basePort !== NULL) {
++      $request->server->set('SERVER_PORT', $basePort);
++    }
++  }
++  $kernel->getContainer()
++    ->get('request_stack')
++    ->push($request);
++  // This sets things up, esp loadLegacyIncludes().
++  $kernel->preHandle($request);
++
++  $app = new Application('dex', \Drupal::VERSION);
++  $app->setCommandLoader($kernel->getContainer()->get('console.command_loader'));
++  // Add commands which did not use an attribute, relying solely on configure().
++  if ($kernel->getContainer()->hasParameter('console.command.ids')) {
++    foreach ($kernel->getContainer()->getParameter('console.command.ids') as $id) {
++      $app->add($kernel->getContainer()->get($id));
++    }
++  }
++  return $app;
++};
+diff --git a/core/composer.json b/core/composer.json
+index a12eb72af42a..3165b532c2da 100644
+--- a/core/composer.json
++++ b/core/composer.json
+@@ -29,6 +29,7 @@
+         "symfony/mailer": "^7.1",
+         "symfony/mime": "^7.1",
+         "symfony/routing": "^7.1",
++        "symfony/runtime": "^7.1",
+         "symfony/serializer": "^7.1",
+         "symfony/validator": "^7.1",
+         "symfony/process": "^7.1",
+@@ -114,6 +115,9 @@
+             "includes/bootstrap.inc"
+         ]
+     },
++    "bin": [
++        "bin/dex"
++    ],
+     "config": {
+         "preferred-install": "dist"
+     },
+diff --git a/core/core.services.yml b/core/core.services.yml
+index b45ee4038330..49a962fc7248 100644
+--- a/core/core.services.yml
++++ b/core/core.services.yml
+@@ -1773,6 +1773,13 @@ services:
+     class: Drupal\Core\Template\Loader\StringLoader
+     tags:
+       - { name: twig.loader, priority: -100 }
++  # Service holding the commands made available to the `dex` command.
++  # The service is completed with SystemCompilerPass.
++  console.command_loader:
++    class: Symfony\Component\Console\CommandLoader\CommandLoaderInterface
++    public: true
++    arguments:
++      - "!abstract 'service locator added by container pass'"
+   element_info:
+     alias: plugin.manager.element_info
+   file.htaccess_writer:
+diff --git a/core/lib/Drupal/Core/CoreServiceProvider.php b/core/lib/Drupal/Core/CoreServiceProvider.php
+index f8221fe69126..91dcab763ae9 100644
+--- a/core/lib/Drupal/Core/CoreServiceProvider.php
++++ b/core/lib/Drupal/Core/CoreServiceProvider.php
+@@ -9,6 +9,7 @@
+ use Drupal\Core\DependencyInjection\Compiler\CorsCompilerPass;
+ use Drupal\Core\DependencyInjection\Compiler\DeprecatedServicePass;
+ use Drupal\Core\DependencyInjection\Compiler\DevelopmentSettingsPass;
++use Drupal\Core\DependencyInjection\Compiler\DexCompilerPass;
+ use Drupal\Core\DependencyInjection\Compiler\LoggerAwarePass;
+ use Drupal\Core\DependencyInjection\Compiler\ModifyServiceDefinitionsPass;
+ use Drupal\Core\DependencyInjection\Compiler\ProxyServicesPass;
+@@ -81,6 +82,9 @@ public function register(ContainerBuilder $container) {
+ 
+     $container->addCompilerPass(new MainContentRenderersPass());
+ 
++    // Collect and register Commands.
++    $container->addCompilerPass(new DexCompilerPass());
++
+     // Collect tagged handler services as method calls on consumer services.
+     $container->addCompilerPass(new TaggedHandlersPass());
+     $container->addCompilerPass(new RegisterStreamWrappersPass());
+diff --git a/core/lib/Drupal/Core/DependencyInjection/Compiler/DexCompilerPass.php b/core/lib/Drupal/Core/DependencyInjection/Compiler/DexCompilerPass.php
+new file mode 100644
+index 000000000000..6abe9d2a295a
+--- /dev/null
++++ b/core/lib/Drupal/Core/DependencyInjection/Compiler/DexCompilerPass.php
+@@ -0,0 +1,176 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\Core\DependencyInjection\Compiler;
++
++use Symfony\Component\Console\Attribute\AsCommand;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\CommandLoader\ContainerCommandLoader;
++use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
++use Symfony\Component\DependencyInjection\Compiler\ServiceLocatorTagPass;
++use Symfony\Component\DependencyInjection\ContainerBuilder;
++use Symfony\Component\DependencyInjection\Definition;
++use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
++use Symfony\Component\DependencyInjection\Reference;
++
++/**
++ * System compiler pass.
++ *
++ * Inspired by:
++ *  - \Symfony\Component\Console\DependencyInjection\AddConsoleCommandPass()
++ *  - \Symfony\Bundle\FrameworkBundle\Console\Application::registerCommands()
++ */
++final class DexCompilerPass implements CompilerPassInterface {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function process(ContainerBuilder $container): void {
++    $serviceIds = [];
++
++    // Drupal doesn't have a way of getting all classes with a particular
++    // attribute yet, so we do it ourselves.
++    // Most of this is copied from the 'sm' project.
++    foreach ($this->getClasses($container->getParameter('container.namespaces')) as $className) {
++      // Don't create a service definition if this class is already a service.
++      if ($container->hasDefinition($className) || $container->hasAlias($className)) {
++        continue;
++      }
++
++      // Check the full class hierarchy exists, in case the discovered class
++      // extends class of optional dependencies, like Drush or Drupal Console.
++      $reflection = new \ReflectionClass($className);
++      while ($parent = $reflection->getParentClass()) {
++        if (!class_exists($parent->getName())) {
++          continue;
++        }
++        $reflection = $parent;
++      }
++
++      $definition = new Definition($className);
++      $definition
++        ->setAutoconfigured(TRUE)
++        ->setAutowired(TRUE)
++        ->setPublic(TRUE)
++        ->setTags(['console.command' => []]);
++
++      $container->setDefinition($className, $definition);
++    }
++
++    // Register commands from above to the container.
++    $commandServices = $container->findTaggedServiceIds('console.command', TRUE);
++    $lazyCommandRefs = [];
++    $lazyCommandMap = [];
++    foreach ($commandServices as $id => $tags) {
++      $definition = $container->getDefinition($id);
++      /** @var class-string<\Symfony\Component\Console\Command\Command> $class */
++      $class = $container->getParameterBag()->resolveValue($definition->getClass());
++
++      $aliases = $tags[0]['command'] ?? NULL;
++      if ($aliases === NULL) {
++        if (!$r = $container->getReflectionClass($class)) {
++          throw new InvalidArgumentException(sprintf('Class "%s" used for service "%s" cannot be found.', $class, $id));
++        }
++        if (!$r->isSubclassOf(Command::class)) {
++          throw new InvalidArgumentException(sprintf('The service "%s" tagged "%s" must be a subclass of "%s".', $id, 'console.command', Command::class));
++        }
++        $aliases = str_replace('%', '%%', $class::getDefaultName() ?? '');
++      }
++
++      $aliases = explode('|', $aliases);
++      $commandName = array_shift($aliases);
++
++      if ('' === $commandName) {
++        $commandName = array_shift($aliases);
++      }
++
++      if (NULL === $commandName) {
++        if (!$definition->isPublic()) {
++          // If the service is not public, make a public alias.
++          $commandId = 'console.command.public_alias.' . $id;
++          $container->setAlias($commandId, $id)->setPublic(TRUE);
++          $id = $commandId;
++        }
++        $serviceIds[] = $id;
++
++        continue;
++      }
++
++      $definition = $container->getDefinition($id);
++      /** @var class-string<\Symfony\Component\Console\Command\Command> $class */
++      $class = $container->getParameterBag()->resolveValue($definition->getClass());
++      // Pulls in the command name from the PHP attribute:
++      $aliases = [str_replace('%', '%%', $class::getDefaultName() ?? '')];
++      foreach ($aliases as $alias) {
++        $lazyCommandMap[$alias] = $id;
++      }
++      $lazyCommandRefs[$id] = new Reference($id);
++    }
++
++    $container
++      ->getDefinition('console.command_loader')
++      ->setClass(ContainerCommandLoader::class)
++      ->setArguments([ServiceLocatorTagPass::register($container, $lazyCommandRefs), $lazyCommandMap]);
++
++    $container->setParameter('console.command.ids', $serviceIds);
++  }
++
++  /**
++   * Get command classes for the provided namespaces.
++   *
++   * @param array<class-string, string> $namespaces
++   *   An array of namespaces. Where keys are class strings and values are
++   *   paths.
++   *
++   * @return \Generator<class-string>
++   *   Generates class strings.
++   *
++   * @throws \ReflectionException
++   */
++  private function getClasses(array $namespaces): \Generator {
++    foreach ($namespaces as $namespace => $dirs) {
++      $dirs = (array) $dirs;
++      foreach ($dirs as $dir) {
++        $dir .= '/Command';
++        if (!file_exists($dir)) {
++          continue;
++        }
++        $namespace .= '\\Command';
++
++        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir, \FilesystemIterator::KEY_AS_PATHNAME | \FilesystemIterator::CURRENT_AS_FILEINFO | \RecursiveDirectoryIterator::SKIP_DOTS), \RecursiveIteratorIterator::SELF_FIRST);
++        /** @var \SplFileInfo $fileinfo */
++        foreach ($iterator as $fileinfo) {
++          if ($fileinfo->getExtension() !== 'php') {
++            continue;
++          }
++
++          /** @var \RecursiveDirectoryIterator|null $subDir */
++          $subDir = $iterator->getSubIterator();
++          if (NULL === $subDir) {
++            continue;
++          }
++
++          $subDir = $subDir->getSubPath();
++          $subDir = $subDir !== '' ? str_replace(DIRECTORY_SEPARATOR, '\\', $subDir) . '\\' : '';
++          /** @var class-string $class */
++          $class = $namespace . '\\' . $subDir . $fileinfo->getBasename('.php');
++
++          try {
++            $reflectionClass = new \ReflectionClass($class);
++          }
++          catch (\Error) {
++            // Skip commands where the hierarchy is unresolvable due to
++            // optional dependencies.
++            continue;
++          }
++
++          if (count($reflectionClass->getAttributes(AsCommand::class)) > 0) {
++            yield $class;
++          }
++        }
++      }
++    }
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/dex_test/dex_test.info.yml b/core/modules/system/tests/modules/dex_test/dex_test.info.yml
+new file mode 100644
+index 000000000000..ab79ccb4eb01
+--- /dev/null
++++ b/core/modules/system/tests/modules/dex_test/dex_test.info.yml
+@@ -0,0 +1,4 @@
++name: Dex Console tests
++type: module
++package: Testing
++version: VERSION
+diff --git a/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
+new file mode 100644
+index 000000000000..4c85f907603c
+--- /dev/null
++++ b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
+@@ -0,0 +1,41 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\dex_test\Command;
++
++use Drupal\Component\Datetime\TimeInterface;
++use Symfony\Component\Console\Attribute\AsCommand;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++
++/**
++ * An example command.
++ */
++#[AsCommand(name: 'example:command', description: 'An example command.')]
++final class DexExampleCommand extends Command {
++
++  /**
++   * Constructs a command with autowiring.
++   */
++  public function __construct(
++    private readonly TimeInterface $dateTime,
++  ) {
++    parent::__construct();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function execute(InputInterface $input, OutputInterface $output): int {
++    $io = new SymfonyStyle($input, $output);
++
++    $now = new \DateTimeImmutable('@' . $this->dateTime->getRequestTime());
++    $io->note('The current time is ' . $now->format('r'));
++
++    return static::SUCCESS;
++  }
++
++}
+-- 
+GitLab
+
+
+From 7b8210d4269849b80b32b3efe0feb93343cec55d Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 21:32:23 +0800
+Subject: [PATCH 2/9] Tests
+
+---
+ core/bin/dex                                  |   4 +-
+ .../modules/dex_test/dex_test.services.yml    |  14 +++
+ .../src/Command/DexExampleCommand.php         |  30 ++++-
+ .../Command/DexExampleConfigureCommand.php    |  35 ++++++
+ .../src/Command/DexExamplePrivateCommand.php  |  36 ++++++
+ .../KernelTests/Core/Dex/DexConsoleTest.php   | 113 ++++++++++++++++++
+ 6 files changed, 225 insertions(+), 7 deletions(-)
+ create mode 100644 core/modules/system/tests/modules/dex_test/dex_test.services.yml
+ create mode 100644 core/modules/system/tests/modules/dex_test/src/Command/DexExampleConfigureCommand.php
+ create mode 100644 core/modules/system/tests/modules/dex_test/src/Command/DexExamplePrivateCommand.php
+ create mode 100644 core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+
+diff --git a/core/bin/dex b/core/bin/dex
+index 5863ef49904c..921ba4890026 100755
+--- a/core/bin/dex
++++ b/core/bin/dex
+@@ -38,9 +38,7 @@ return static function (array $context): Application {
+   $basePort = $context['PORT'] ?? NULL;
+   if ($baseDomain !== NULL) {
+     $request->server->set('SERVER_NAME', $baseDomain);
+-    if ($basePort !== NULL) {
+-      $request->server->set('SERVER_PORT', $basePort);
+-    }
++    $request->server->set('SERVER_PORT', $basePort ?? 80);
+   }
+   $kernel->getContainer()
+     ->get('request_stack')
+diff --git a/core/modules/system/tests/modules/dex_test/dex_test.services.yml b/core/modules/system/tests/modules/dex_test/dex_test.services.yml
+new file mode 100644
+index 000000000000..ce8c37fa84e2
+--- /dev/null
++++ b/core/modules/system/tests/modules/dex_test/dex_test.services.yml
+@@ -0,0 +1,14 @@
++services:
++  _defaults:
++    autowire: true
++    autoconfigure: true
++    public: false
++
++  Drupal\dex_test\Command\DexExampleConfigureCommand:
++    tags:
++      - { name: 'console.command' }
++    public: true
++
++  Drupal\dex_test\Command\DexExamplePrivateCommand:
++    tags:
++      - { name: 'console.command' }
+diff --git a/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
+index 4c85f907603c..4eccbe43278d 100644
+--- a/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
++++ b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleCommand.php
+@@ -4,10 +4,13 @@
+ 
+ namespace Drupal\dex_test\Command;
+ 
+-use Drupal\Component\Datetime\TimeInterface;
++use Drupal\autowire_test\TestService;
++use Drupal\Core\Url;
+ use Symfony\Component\Console\Attribute\AsCommand;
+ use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputArgument;
+ use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Input\InputOption;
+ use Symfony\Component\Console\Output\OutputInterface;
+ use Symfony\Component\Console\Style\SymfonyStyle;
+ 
+@@ -21,19 +24,38 @@ final class DexExampleCommand extends Command {
+    * Constructs a command with autowiring.
+    */
+   public function __construct(
+-    private readonly TimeInterface $dateTime,
++    private readonly TestService $testService,
+   ) {
+     parent::__construct();
+   }
+ 
++  /**
++   * {@inheritdoc}
++   */
++  protected function configure(): void {
++    $this
++      ->addArgument('argument-test', mode: InputArgument::OPTIONAL)
++      ->addArgument('scenario', mode: InputArgument::OPTIONAL)
++      ->addOption('option-test', mode: InputOption::VALUE_NONE);
++  }
++
+   /**
+    * {@inheritdoc}
+    */
+   protected function execute(InputInterface $input, OutputInterface $output): int {
+     $io = new SymfonyStyle($input, $output);
+ 
+-    $now = new \DateTimeImmutable('@' . $this->dateTime->getRequestTime());
+-    $io->note('The current time is ' . $now->format('r'));
++    $scenario = $input->getArgument('scenario');
++    if ('absolute_url' === $scenario) {
++      $io->note('Base Url test: ' . Url::fromUserInput('/abc')->setAbsolute()->toString());
++
++      return static::SUCCESS;
++    }
++
++    $io->note('Option test: ' . ($input->getOption('option-test') ? 'Yes' : 'No'));
++    $io->note('Argument test: ' . ($input->getArgument('argument-test') ? 'Yes' : 'No'));
++    $io->note('Dependency injection test: ' . $this->testService->getTestInjection()::class);
++    $io->success('Done.');
+ 
+     return static::SUCCESS;
+   }
+diff --git a/core/modules/system/tests/modules/dex_test/src/Command/DexExampleConfigureCommand.php b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleConfigureCommand.php
+new file mode 100644
+index 000000000000..57fdc0d89e97
+--- /dev/null
++++ b/core/modules/system/tests/modules/dex_test/src/Command/DexExampleConfigureCommand.php
+@@ -0,0 +1,35 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\dex_test\Command;
++
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++
++/**
++ * An example command using configure(), not AsCommand attribute.
++ */
++final class DexExampleConfigureCommand extends Command {
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function configure(): void {
++    $this
++      ->setName('example:command-configured');
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function execute(InputInterface $input, OutputInterface $output): int {
++    $io = new SymfonyStyle($input, $output);
++    $io->success('Done with configured command.');
++
++    return static::SUCCESS;
++  }
++
++}
+diff --git a/core/modules/system/tests/modules/dex_test/src/Command/DexExamplePrivateCommand.php b/core/modules/system/tests/modules/dex_test/src/Command/DexExamplePrivateCommand.php
+new file mode 100644
+index 000000000000..5d9315cf301e
+--- /dev/null
++++ b/core/modules/system/tests/modules/dex_test/src/Command/DexExamplePrivateCommand.php
+@@ -0,0 +1,36 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\dex_test\Command;
++
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++
++/**
++ * A private command.
++ *
++ * This command must not have an attribute or name via configure().
++ */
++final class DexExamplePrivateCommand extends Command {
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getName(): ?string {
++    return 'example:command-private';
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function execute(InputInterface $input, OutputInterface $output): int {
++    $io = new SymfonyStyle($input, $output);
++    $io->success('Done with private command.');
++
++    return static::SUCCESS;
++  }
++
++}
+diff --git a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+new file mode 100644
+index 000000000000..156190c7cbe1
+--- /dev/null
++++ b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+@@ -0,0 +1,113 @@
++<?php
++
++declare(strict_types=1);
++
++namespace Drupal\KernelTests\Core\Dex;
++
++use Drupal\autowire_test\TestInjection;
++use Drupal\dex_test\Command\DexExampleCommand;
++use Drupal\dex_test\Command\DexExampleConfigureCommand;
++use Drupal\dex_test\Command\DexExamplePrivateCommand;
++use Drupal\KernelTests\KernelTestBase;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Tester\ApplicationTester;
++use Symfony\Component\Console\Tester\CommandTester;
++
++final class DexConsoleTest extends KernelTestBase {
++
++  /**
++   * {@inheritdoc}
++   */
++  protected static $modules = [
++    'autowire_test',
++    'dex_test',
++  ];
++
++  /**
++   * Tests the application wrapped by symfony/runtime.
++   */
++  public function testApplication(): void {
++    $tester = $this->applicationTester();
++    $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command']));
++    $this->assertStringContainsString('Dependency injection test: ' . TestInjection::class, $tester->getDisplay());
++    $this->assertStringContainsString('Option test: No', $tester->getDisplay());
++    $this->assertStringContainsString('Argument test: No', $tester->getDisplay());
++    $this->assertStringContainsString('[OK] Done', $tester->getDisplay());
++
++    // When host is provided without port, 80 is used, which is omitted from
++    // generated URLs.
++    $tester = $this->applicationTester(['HOST' => 'example.com']);
++    $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command', 'scenario' => 'absolute_url']));
++    $this->assertStringContainsString('Base Url test: http://example.com/abc', $tester->getDisplay());
++
++    // A different port is present in generated URLs.
++    $tester = $this->applicationTester(['HOST' => 'example.com', 'PORT' => 3333]);
++    $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command', 'scenario' => 'absolute_url']));
++    $this->assertStringContainsString('Base Url test: http://example.com:3333/abc', $tester->getDisplay());
++
++    // Test legacy command.
++    $tester = $this->applicationTester();
++    $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command-configured']));
++    $this->assertStringContainsString('Done with configured command.', $tester->getDisplay());
++
++    // Test private command.
++    $tester = $this->applicationTester();
++    $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command-private']));
++    $this->assertStringContainsString('Done with private command.', $tester->getDisplay());
++  }
++
++  /**
++   * Test command loader has the discovered commands.
++   *
++   * @covers \Drupal\Core\DependencyInjection\Compiler\DexCompilerPass
++   */
++  public function testCommandLoader(): void {
++    /** @var \Symfony\Component\Console\CommandLoader\CommandLoaderInterface $commandLoader */
++    $commandLoader = \Drupal::service('console.command_loader');
++    $command = $commandLoader->get('example:command');
++    $this->assertInstanceOf(DexExampleCommand::class, $command);
++    $this->assertTrue(\Drupal::hasService(DexExampleCommand::class));
++  }
++
++  /**
++   * Test command loader has the discovered legacy commands IDs.
++   *
++   * @covers \Drupal\Core\DependencyInjection\Compiler\DexCompilerPass
++   */
++  public function testCommandIds(): void {
++    $commandIds = \Drupal::getContainer()->getParameter('console.command.ids');
++    $this->assertEquals([
++      DexExampleConfigureCommand::class,
++      // A public alias is created for this private command.
++      'console.command.public_alias.' . DexExamplePrivateCommand::class,
++    ], $commandIds);
++  }
++
++  /**
++   * Integration test for a command.
++   *
++   * Tests command is registered to the container, and has expected input/output
++   * from options, arguments, autowiring, and return code.
++   *
++   * @covers \Drupal\dex_test\Command\DexExampleCommand
++   */
++  public function testConsoleCommand(): void {
++    /** @var DexExampleCommand $command */
++    $command = \Drupal::service(DexExampleCommand::class);
++    $tester = new CommandTester($command);
++    $code = $tester->execute(['argument-test' => 'Foo', '--option-test' => TRUE]);
++    $this->assertStringContainsString('Dependency injection test: ' . TestInjection::class, $tester->getDisplay());
++    $this->assertStringContainsString('Option test: Yes', $tester->getDisplay());
++    $this->assertStringContainsString('Argument test: Yes', $tester->getDisplay());
++    $this->assertStringContainsString('[OK] Done', $tester->getDisplay());
++    $this->assertEquals(Command::SUCCESS, $code);
++  }
++
++  private function applicationTester(array $context = []): ApplicationTester {
++    $application = include __DIR__ . '/../../../../../../vendor/bin/dex';
++    $application = $application($context);
++    $application->setAutoExit(false);
++    return new ApplicationTester($application);
++  }
++
++}
+-- 
+GitLab
+
+
+From 4de279b4c7fcd7ada5bf2f8decffcb8a405a3e04 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 21:36:25 +0800
+Subject: [PATCH 3/9] how does this work....
+
+---
+ composer.json                                 |  3 +-
+ composer.lock                                 | 89 ++++++++++++++++++-
+ .../Metapackage/CoreRecommended/composer.json |  1 +
+ 3 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/composer.json b/composer.json
+index 9928fd0e74bc..d7c241d2b31c 100644
+--- a/composer.json
++++ b/composer.json
+@@ -12,7 +12,8 @@
+         "composer/installers": "^2.0",
+         "drupal/core": "self.version",
+         "drupal/core-project-message": "self.version",
+-        "drupal/core-vendor-hardening": "self.version"
++        "drupal/core-vendor-hardening": "self.version",
++        "symfony/runtime": "^7.1"
+     },
+     "require-dev": {
+         "behat/mink": "^1.11",
+diff --git a/composer.lock b/composer.lock
+index ef6ce4db0204..8f5e19bd6854 100644
+--- a/composer.lock
++++ b/composer.lock
+@@ -4,7 +4,7 @@
+         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+         "This file is @generated automatically"
+     ],
+-    "content-hash": "5aa430e02129afe79c7751048cb329fb",
++    "content-hash": "12557c715bd03b762cd0d5bbb9d402c6",
+     "packages": [
+         {
+             "name": "asm89/stack-cors",
+@@ -495,7 +495,7 @@
+             "dist": {
+                 "type": "path",
+                 "url": "core",
+-                "reference": "7ef1db8ef53f81722f34bc38512af9c4665d9d72"
++                "reference": "677857e8cef5ac2a02d65559f7514ecd5404df05"
+             },
+             "require": {
+                 "asm89/stack-cors": "^2.1",
+@@ -539,6 +539,7 @@
+                 "symfony/process": "^7.1",
+                 "symfony/psr-http-message-bridge": "^7.1",
+                 "symfony/routing": "^7.1",
++                "symfony/runtime": "^7.1",
+                 "symfony/serializer": "^7.1",
+                 "symfony/validator": "^7.1",
+                 "symfony/yaml": "^7.1",
+@@ -576,6 +577,9 @@
+             "suggest": {
+                 "ext-zip": "Needed to extend the plugin.manager.archiver service capability with the handling of files in the ZIP format."
+             },
++            "bin": [
++                "bin/dex"
++            ],
+             "type": "drupal-core",
+             "extra": {
+                 "drupal-scaffold": {
+@@ -3590,6 +3594,85 @@
+             ],
+             "time": "2024-05-28T06:54:05+00:00"
+         },
++        {
++            "name": "symfony/runtime",
++            "version": "v7.1.1",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/symfony/runtime.git",
++                "reference": "ea34522c447dd91a2b31cb330ee4540a56ba53f6"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/symfony/runtime/zipball/ea34522c447dd91a2b31cb330ee4540a56ba53f6",
++                "reference": "ea34522c447dd91a2b31cb330ee4540a56ba53f6",
++                "shasum": ""
++            },
++            "require": {
++                "composer-plugin-api": "^1.0|^2.0",
++                "php": ">=8.2"
++            },
++            "conflict": {
++                "symfony/dotenv": "<6.4"
++            },
++            "require-dev": {
++                "composer/composer": "^2.6",
++                "symfony/console": "^6.4|^7.0",
++                "symfony/dotenv": "^6.4|^7.0",
++                "symfony/http-foundation": "^6.4|^7.0",
++                "symfony/http-kernel": "^6.4|^7.0"
++            },
++            "type": "composer-plugin",
++            "extra": {
++                "class": "Symfony\\Component\\Runtime\\Internal\\ComposerPlugin"
++            },
++            "autoload": {
++                "psr-4": {
++                    "Symfony\\Component\\Runtime\\": "",
++                    "Symfony\\Runtime\\Symfony\\Component\\": "Internal/"
++                },
++                "exclude-from-classmap": [
++                    "/Tests/"
++                ]
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Nicolas Grekas",
++                    "email": "p@tchwork.com"
++                },
++                {
++                    "name": "Symfony Community",
++                    "homepage": "https://symfony.com/contributors"
++                }
++            ],
++            "description": "Enables decoupling PHP applications from global state",
++            "homepage": "https://symfony.com",
++            "keywords": [
++                "runtime"
++            ],
++            "support": {
++                "source": "https://github.com/symfony/runtime/tree/v7.1.1"
++            },
++            "funding": [
++                {
++                    "url": "https://symfony.com/sponsor",
++                    "type": "custom"
++                },
++                {
++                    "url": "https://github.com/fabpot",
++                    "type": "github"
++                },
++                {
++                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
++                    "type": "tidelift"
++                }
++            ],
++            "time": "2024-05-31T14:55:39+00:00"
++        },
+         {
+             "name": "symfony/serializer",
+             "version": "v7.1.0",
+@@ -9332,5 +9415,5 @@
+     "platform-overrides": {
+         "php": "8.3.0"
+     },
+-    "plugin-api-version": "2.6.0"
++    "plugin-api-version": "2.3.0"
+ }
+diff --git a/composer/Metapackage/CoreRecommended/composer.json b/composer/Metapackage/CoreRecommended/composer.json
+index c9a15fa82f24..e4bc8b068bd3 100644
+--- a/composer/Metapackage/CoreRecommended/composer.json
++++ b/composer/Metapackage/CoreRecommended/composer.json
+@@ -52,6 +52,7 @@
+         "symfony/process": "~v7.1.0",
+         "symfony/psr-http-message-bridge": "~v7.1.0",
+         "symfony/routing": "~v7.1.0",
++        "symfony/runtime": "~v7.1.1",
+         "symfony/serializer": "~v7.1.0",
+         "symfony/service-contracts": "~v3.5.0",
+         "symfony/string": "~v7.1.0",
+-- 
+GitLab
+
+
+From 1723b729ef22de98ef10ac64d2b8d16156c759b0 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 21:37:12 +0800
+Subject: [PATCH 4/9] linting
+
+---
+ core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+index 156190c7cbe1..a0b78b5ddc29 100644
+--- a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
++++ b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+@@ -92,7 +92,7 @@ public function testCommandIds(): void {
+    * @covers \Drupal\dex_test\Command\DexExampleCommand
+    */
+   public function testConsoleCommand(): void {
+-    /** @var DexExampleCommand $command */
++    /** @var \Drupal\dex_test\Command\DexExampleCommand $command */
+     $command = \Drupal::service(DexExampleCommand::class);
+     $tester = new CommandTester($command);
+     $code = $tester->execute(['argument-test' => 'Foo', '--option-test' => TRUE]);
+@@ -106,7 +106,7 @@ public function testConsoleCommand(): void {
+   private function applicationTester(array $context = []): ApplicationTester {
+     $application = include __DIR__ . '/../../../../../../vendor/bin/dex';
+     $application = $application($context);
+-    $application->setAutoExit(false);
++    $application->setAutoExit(FALSE);
+     return new ApplicationTester($application);
+   }
+ 
+-- 
+GitLab
+
+
+From 7ab41c1033917dad77bf3dfaafbbd51812e39e15 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 21:46:43 +0800
+Subject: [PATCH 5/9] fixups
+
+---
+ core/core.services.yml                                    | 2 +-
+ core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/core/core.services.yml b/core/core.services.yml
+index 49a962fc7248..34d668915794 100644
+--- a/core/core.services.yml
++++ b/core/core.services.yml
+@@ -1774,7 +1774,7 @@ services:
+     tags:
+       - { name: twig.loader, priority: -100 }
+   # Service holding the commands made available to the `dex` command.
+-  # The service is completed with SystemCompilerPass.
++  # The service is completed with DexCompilerPass.
+   console.command_loader:
+     class: Symfony\Component\Console\CommandLoader\CommandLoaderInterface
+     public: true
+diff --git a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+index a0b78b5ddc29..737eea2b1d45 100644
+--- a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
++++ b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+@@ -13,6 +13,11 @@
+ use Symfony\Component\Console\Tester\ApplicationTester;
+ use Symfony\Component\Console\Tester\CommandTester;
+ 
++/**
++ * Tests integration with Symfony Console.
++ *
++ * @group Dex
++ */
+ final class DexConsoleTest extends KernelTestBase {
+ 
+   /**
+-- 
+GitLab
+
+
+From 2cb32b2a9ae5e6d92190dacecf630149671581f8 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 22:03:37 +0800
+Subject: [PATCH 6/9] not sure whats goin on
+
+---
+ composer.json                                      | 6 ++----
+ composer.lock                                      | 2 +-
+ composer/Metapackage/CoreRecommended/composer.json | 2 +-
+ composer/Template/LegacyProject/composer.json      | 3 ++-
+ composer/Template/RecommendedProject/composer.json | 3 ++-
+ 5 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/composer.json b/composer.json
+index d7c241d2b31c..093a47ffb084 100644
+--- a/composer.json
++++ b/composer.json
+@@ -12,8 +12,7 @@
+         "composer/installers": "^2.0",
+         "drupal/core": "self.version",
+         "drupal/core-project-message": "self.version",
+-        "drupal/core-vendor-hardening": "self.version",
+-        "symfony/runtime": "^7.1"
++        "drupal/core-vendor-hardening": "self.version"
+     },
+     "require-dev": {
+         "behat/mink": "^1.11",
+@@ -65,8 +64,7 @@
+             "drupal/core-vendor-hardening": true,
+             "phpstan/extension-installer": true,
+             "dealerdirect/phpcodesniffer-composer-installer": true,
+-            "php-http/discovery": true,
+-            "symfony/runtime": true
++            "php-http/discovery": true
+         }
+     },
+     "extra": {
+diff --git a/composer.lock b/composer.lock
+index 8f5e19bd6854..9cf64b2e8d3f 100644
+--- a/composer.lock
++++ b/composer.lock
+@@ -4,7 +4,7 @@
+         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+         "This file is @generated automatically"
+     ],
+-    "content-hash": "12557c715bd03b762cd0d5bbb9d402c6",
++    "content-hash": "5aa430e02129afe79c7751048cb329fb",
+     "packages": [
+         {
+             "name": "asm89/stack-cors",
+diff --git a/composer/Metapackage/CoreRecommended/composer.json b/composer/Metapackage/CoreRecommended/composer.json
+index e4bc8b068bd3..60050d0f2f68 100644
+--- a/composer/Metapackage/CoreRecommended/composer.json
++++ b/composer/Metapackage/CoreRecommended/composer.json
+@@ -52,7 +52,7 @@
+         "symfony/process": "~v7.1.0",
+         "symfony/psr-http-message-bridge": "~v7.1.0",
+         "symfony/routing": "~v7.1.0",
+-        "symfony/runtime": "~v7.1.1",
++        "symfony/runtime": "~v7.1.0",
+         "symfony/serializer": "~v7.1.0",
+         "symfony/service-contracts": "~v3.5.0",
+         "symfony/string": "~v7.1.0",
+diff --git a/composer/Template/LegacyProject/composer.json b/composer/Template/LegacyProject/composer.json
+index 8ec53f57580f..b26fcc792695 100644
+--- a/composer/Template/LegacyProject/composer.json
++++ b/composer/Template/LegacyProject/composer.json
+@@ -37,7 +37,8 @@
+             "drupal/core-vendor-hardening": true,
+             "phpstan/extension-installer": true,
+             "dealerdirect/phpcodesniffer-composer-installer": true,
+-            "php-http/discovery": true
++            "php-http/discovery": true,
++            "symfony/runtime": true
+         },
+         "sort-packages": true
+     },
+diff --git a/composer/Template/RecommendedProject/composer.json b/composer/Template/RecommendedProject/composer.json
+index bd988e768da8..dc912bc6c86b 100644
+--- a/composer/Template/RecommendedProject/composer.json
++++ b/composer/Template/RecommendedProject/composer.json
+@@ -35,7 +35,8 @@
+             "drupal/core-project-message": true,
+             "phpstan/extension-installer": true,
+             "dealerdirect/phpcodesniffer-composer-installer": true,
+-            "php-http/discovery": true
++            "php-http/discovery": true,
++            "symfony/runtime": true
+         },
+         "sort-packages": true
+     },
+-- 
+GitLab
+
+
+From ad1da5e7eb35a5cd861ccb20845f656bbc334f67 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 22:07:21 +0800
+Subject: [PATCH 7/9] this got removed
+
+---
+ composer.json | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/composer.json b/composer.json
+index 093a47ffb084..9928fd0e74bc 100644
+--- a/composer.json
++++ b/composer.json
+@@ -64,7 +64,8 @@
+             "drupal/core-vendor-hardening": true,
+             "phpstan/extension-installer": true,
+             "dealerdirect/phpcodesniffer-composer-installer": true,
+-            "php-http/discovery": true
++            "php-http/discovery": true,
++            "symfony/runtime": true
+         }
+     },
+     "extra": {
+-- 
+GitLab
+
+
+From b265f623f3b0bcadc28c0c10d115c8d1b5cc44a9 Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Sun, 9 Jun 2024 22:30:39 +0800
+Subject: [PATCH 8/9] restore_error_handler
+
+ 1) Drupal\KernelTests\Core\Dex\DexConsoleTest::testApplication
+    RuntimeException: testApplication registered its own error handler
+    ([function] _drupal_error_handler) without restoring the previous one
+    before or during tear down. This can cause unpredictable test results.
+    Ensure the test cleans up after itself.
+---
+ core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+index 737eea2b1d45..9de33f4ee76a 100644
+--- a/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
++++ b/core/tests/Drupal/KernelTests/Core/Dex/DexConsoleTest.php
+@@ -59,6 +59,8 @@ public function testApplication(): void {
+     $tester = $this->applicationTester();
+     $this->assertEquals(Command::SUCCESS, $tester->run(['command' => 'example:command-private']));
+     $this->assertStringContainsString('Done with private command.', $tester->getDisplay());
++
++    restore_error_handler();
+   }
+ 
+   /**
+-- 
+GitLab
+
+
+From 43439e58d46409e4abfd16bf4e286da6848949bf Mon Sep 17 00:00:00 2001
+From: dpi <pro@danielph.in>
+Date: Mon, 10 Jun 2024 01:42:02 +0800
+Subject: [PATCH 9/9] maybe
+
+---
+ composer.lock | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/composer.lock b/composer.lock
+index 9cf64b2e8d3f..ae4118a4e101 100644
+--- a/composer.lock
++++ b/composer.lock
+@@ -3596,16 +3596,16 @@
+         },
+         {
+             "name": "symfony/runtime",
+-            "version": "v7.1.1",
++            "version": "v7.1.0",
+             "source": {
+                 "type": "git",
+                 "url": "https://github.com/symfony/runtime.git",
+-                "reference": "ea34522c447dd91a2b31cb330ee4540a56ba53f6"
++                "reference": "e120730ef206b31bb5521b1a2389c058adbba9c7"
+             },
+             "dist": {
+                 "type": "zip",
+-                "url": "https://api.github.com/repos/symfony/runtime/zipball/ea34522c447dd91a2b31cb330ee4540a56ba53f6",
+-                "reference": "ea34522c447dd91a2b31cb330ee4540a56ba53f6",
++                "url": "https://api.github.com/repos/symfony/runtime/zipball/e120730ef206b31bb5521b1a2389c058adbba9c7",
++                "reference": "e120730ef206b31bb5521b1a2389c058adbba9c7",
+                 "shasum": ""
+             },
+             "require": {
+@@ -3655,7 +3655,7 @@
+                 "runtime"
+             ],
+             "support": {
+-                "source": "https://github.com/symfony/runtime/tree/v7.1.1"
++                "source": "https://github.com/symfony/runtime/tree/v7.1.0"
+             },
+             "funding": [
+                 {
+@@ -3671,7 +3671,7 @@
+                     "type": "tidelift"
+                 }
+             ],
+-            "time": "2024-05-31T14:55:39+00:00"
++            "time": "2024-04-18T09:29:19+00:00"
+         },
+         {
+             "name": "symfony/serializer",
+@@ -5435,12 +5435,12 @@
+             "version": "v5.2.13",
+             "source": {
+                 "type": "git",
+-                "url": "https://github.com/justinrainbow/json-schema.git",
++                "url": "https://github.com/jsonrainbow/json-schema.git",
+                 "reference": "fbbe7e5d79f618997bc3332a6f49246036c45793"
+             },
+             "dist": {
+                 "type": "zip",
+-                "url": "https://api.github.com/repos/justinrainbow/json-schema/zipball/fbbe7e5d79f618997bc3332a6f49246036c45793",
++                "url": "https://api.github.com/repos/jsonrainbow/json-schema/zipball/fbbe7e5d79f618997bc3332a6f49246036c45793",
+                 "reference": "fbbe7e5d79f618997bc3332a6f49246036c45793",
+                 "shasum": ""
+             },
+@@ -5495,8 +5495,8 @@
+                 "schema"
+             ],
+             "support": {
+-                "issues": "https://github.com/justinrainbow/json-schema/issues",
+-                "source": "https://github.com/justinrainbow/json-schema/tree/v5.2.13"
++                "issues": "https://github.com/jsonrainbow/json-schema/issues",
++                "source": "https://github.com/jsonrainbow/json-schema/tree/v5.2.13"
+             },
+             "time": "2023-09-26T02:20:38+00:00"
+         },
+-- 
+GitLab
+
