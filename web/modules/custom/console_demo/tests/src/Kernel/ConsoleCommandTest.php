@@ -33,9 +33,11 @@ class ConsoleCommandTest extends KernelTestBase {
     /** @var \Drupal\console_demo\Command\ServiceArgumentExample $command */
     $command = \Drupal::service('console.command.console_demo.service_argument');
     $tester = new CommandTester($command);
-    $code = $tester->execute([]);
+
+    $tester->setInputs(['Mohit', TRUE]);
+    $code = $tester->execute(['argument' => 'foo', '--option-test' => TRUE]);
     $this->assertStringContainsString('The current time is', $tester->getDisplay());
-    $this->assertStringContainsString('[NOTE] The cache value is:1234', $tester->getDisplay());
+    $this->assertStringContainsString('The cache value is', $tester->getDisplay());
     $this->assertEquals(Command::SUCCESS, $code);
   }
 

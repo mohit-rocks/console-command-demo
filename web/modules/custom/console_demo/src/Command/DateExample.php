@@ -9,7 +9,6 @@ use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
-use Symfony\Component\Console\Style\SymfonyStyle;
 
 /**
  * Example module command.
@@ -30,11 +29,8 @@ final class DateExample extends Command {
    * {@inheritdoc}
    */
   protected function execute(InputInterface $input, OutputInterface $output): int {
-    $io = new SymfonyStyle($input, $output);
-
     $now = new \DateTimeImmutable('@' . $this->dateTime->getRequestTime());
-    $io->note('The current time is ' . $now->format('r'));
-
+    $output->note('The current time is ' . $now->format('r'));
     return static::SUCCESS;
   }
 
