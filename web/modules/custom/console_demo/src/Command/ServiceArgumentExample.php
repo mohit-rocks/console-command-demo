@@ -10,6 +10,7 @@ use Drupal\Component\Datetime\TimeInterface;
 use Drupal\Core\Cache\CacheBackendInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Formatter\OutputFormatterStyle;
 use Symfony\Component\Console\Helper\Table;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -53,17 +54,28 @@ final class ServiceArgumentExample extends Command {
 
   /**
    * {@inheritdoc}
+   *
+   * @throws \Exception
    */
   protected function execute(InputInterface $input, OutputInterface $output): int {
+    $highlight = new OutputFormatterStyle('black', 'bright-cyan', ['bold', 'blink']);
+    $tableHeader = new OutputFormatterStyle('bright-cyan');
     $io = new SymfonyStyle($input, $output);
 
+    // Set the various styles that we can use for the output.
+    $io->getFormatter()->setStyle('highlight', $highlight);
+    $io->getFormatter()->setStyle('table-header', $tableHeader);
+
     // Add a helper question and ask for inputs.
+    $io->section('<highlight>Asking a question!</highlight>❓');
     $helper = $this->getHelper('question');
     $question = new Question('Please enter name: ', 'John Doe!');
     $name = $helper->ask($input, $output, $question);
 
+    $io->newLine();
+    $io->section('<highlight>Asking for a confirmation!</highlight>🤔 ');
     // Confirmation step before the command run.
-    $confirm = new ConfirmationQuestion('Continue with this action?', false);
+    $confirm = new ConfirmationQuestion('Continue with this action? ', false);
     if (!$helper->ask($input, $output, $confirm)) {
       $io->error('Command aborted.');
       return Command::FAILURE;
@@ -75,10 +87,24 @@ final class ServiceArgumentExample extends Command {
     }
     $now = new \DateTimeImmutable('@' . $this->dateTime->getRequestTime());
 
+    $io->newLine();
+    $io->choice('<highlight>Select the option</highlight>📋 ', ['hello', 'world', 'pick'], 'hello');
+
+    $io->newLine();
+    $io->section('<highlight>Starting progress..</highlight>⏳ ');
+
+    // Set the fake progressbar for demo.
+    $io->progressStart(100);
+    sleep(2);
+    $io->progressFinish();
+
     // Table output on the terminal.
+    $io->newLine();
+    $io->section('<highlight>Table output</highlight>');
     $table = new Table($output);
+
     $table
-      ->setHeaders(['Title', 'Value'])
+      ->setHeaders(['<table-header>Title</table-header>', '<table-header>Value</table-header>'])
       ->setRows([
         ['The current time is', $now->format('r')],
         ['The cache value is', $this->cacheData->get(self::CACHE_ID)->data],
@@ -88,6 +114,7 @@ final class ServiceArgumentExample extends Command {
         ['Question response (User name)', $name],
       ]);
     $table->render();
+    $io->note('Command successful. 💧');
     return static::SUCCESS;
   }
 
